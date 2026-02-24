@@ -1,0 +1,62 @@
+services:
+  mediamtx_server:
+    container_name: mediamtx
+    image: bluenviron/mediamtx:latest
+    volumes:
+      - ./recordings:/recordings
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9997/v3/config/global/get"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    ports:
+      - "8554:8554"
+      - "1935:1935"
+      - "8888:8888"
+      - "8889:8889"
+      - "8890:8890/udp"
+      - "8189:8189/udp"
+      - "9996:9996"
+      - "9997:9997"
+    environment:
+      - MTX_RTSPTRANSPORTS=tcp
+    networks:
+      - local
+    restart: unless-stopped
+
+  cpp-app:
+    container_name: cpp-app
+    ipc: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    build:
+      context: .
+      dockerfile: docker/DockerFile.dev_6_0
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-nvcr.io/nvidia/l4t-jetpack:r36.3.0}
+        PARALLEL_JOBS: ${PARALLEL_JOBS:-4}
+    image: cpp-pipeline:${IMAGE_TAG:-latest}
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all,video,compute,graphics,utility
+      - GST_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/gstreamer-1.0
+      - LD_LIBRARY_PATH=/opt/onnxruntime/lib:/usr/local/cuda-12.2/lib64:/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}
+      - CUDA_HOME=/usr/local/cuda-12.2
+      - GST_PLUGIN_FEATURE_RANK=nvarguscamerasrc:NONE
+    volumes:
+      - /tmp:/tmp
+      - ./volumes/trt_cache:/workspace/trt_cache
+    command: ["/bin/bash"]
+    depends_on:
+      mediamtx_server:
+        condition: service_started
+    networks:
+      - local
+    restart: unless-stopped
+
+networks:
+  local:
+    driver: bridge

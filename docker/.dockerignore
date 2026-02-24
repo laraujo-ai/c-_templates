@@ -1,0 +1,65 @@
+# Build artifacts
+cpp_source/build/
+cpp_source/lib/
+build/
+*.o
+*.so
+*.a
+
+# ONNX Runtime build artifacts (we build inside Docker)
+onnxruntime/
+onnxruntime_build/
+
+# Milvus SDK build artifacts (we build inside Docker)
+milvus-sdk-cpp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker/
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Data and outputs
+clips/
+test_cropps/
+volumes/
+weights/*.onnx
+fake_streaming.mp4
+leaving_stuff.mp4
+
+# Documentation
+*.md
+CLAUDE.md
+README.md
+
+# Temporary files
+*.log
+*.tmp
+.env
+.devcontainer/
+
+# Scripts we don't need in the image
+*.sh
+install_*.sh
+build_*.sh
+patch_*.sh

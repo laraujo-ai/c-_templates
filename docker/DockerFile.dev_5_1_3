@@ -1,0 +1,97 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/l4t-tensorrt:r8.5.2.2-devel
+FROM ${BASE_IMAGE} as base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    rm -rf /etc/apt/trusted.gpg.d/* /etc/apt/trusted.gpg 2>/dev/null || true && \
+    mkdir -p /etc/apt/trusted.gpg.d /usr/share/keyrings && \
+    apt-get update --allow-insecure-repositories || true && \
+    apt-get install -y --allow-unauthenticated --no-install-recommends \
+      ca-certificates gnupg dirmngr ubuntu-keyring apt-transport-https curl wget && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C || true && \
+    curl -fsSL https://repo.download.nvidia.com/jetson/jetson-ota-public.asc -o /tmp/nvidia.asc || true && \
+    if [ -s /tmp/nvidia.asc ]; then \
+        gpg --dearmor /tmp/nvidia.asc > /usr/share/keyrings/nvidia-jetson.gpg 2>/dev/null || true && \
+        cp /usr/share/keyrings/nvidia-jetson.gpg /etc/apt/trusted.gpg.d/ 2>/dev/null || true && \
+        apt-key add /tmp/nvidia.asc 2>/dev/null || true && rm /tmp/nvidia.asc; \
+    fi && \
+    apt-get update || true
+
+FROM base as builder-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git wget pkg-config python3 python3-pip python3-dev \
+    libssl-dev zlib1g-dev autoconf automake libtool curl vim tar && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopencv-dev \
+    libeigen3-dev nlohmann-json3-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    pip3 install --no-cache-dir numpy wheel setuptools
+
+RUN wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-aarch64.tar.gz && \
+    tar -xzf cmake-3.27.9-linux-aarch64.tar.gz -C /usr/local --strip-components=1 && \
+    rm cmake-3.27.9-linux-aarch64.tar.gz
+
+WORKDIR /build
+
+FROM builder-base as onnx-builder
+
+ARG ONNXRUNTIME_TAG=v1.16.0
+ARG PARALLEL_JOBS=4
+
+ENV PATH=/usr/local/cuda/bin:${PATH} \
+    CUDA_HOME=/usr/local/cuda \
+    CMAKE_COMMAND=/tmp/mycmake
+
+RUN git config --global http.postBuffer 524288000 && \
+    git config --global http.lowSpeedLimit 0 && \
+    git config --global http.lowSpeedTime 999999 && \
+    git clone --recursive --depth 1 --branch ${ONNXRUNTIME_TAG} https://github.com/microsoft/onnxruntime.git && \
+    mkdir -p /build/eigen && cd /build/eigen && \
+    wget -q https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz && tar xzf eigen-3.4.0.tar.gz
+
+RUN printf '#!/bin/sh\nexec /usr/bin/cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "$@"' > /tmp/mycmake && chmod +x /tmp/mycmake
+
+WORKDIR /build/onnxruntime
+
+RUN NVCC_FOUND=$(find /usr/local/cuda /usr -name nvcc 2>/dev/null | head -1) && \
+    python3 tools/ci_build/build.py \
+        --config Release --build_dir /build/onnxruntime_build --build_shared_lib \
+        --parallel ${PARALLEL_JOBS} --skip_tests --allow_running_as_root \
+        --use_cuda --cuda_home /usr/local/cuda --cudnn_home /usr/lib/aarch64-linux-gnu \
+        --use_tensorrt --tensorrt_home /usr/lib/aarch64-linux-gnu \
+        --cmake_extra_defines \
+            FETCHCONTENT_SOURCE_DIR_EIGEN=/build/eigen/eigen-3.4.0 \
+            onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_BUILD_BENCHMARKS=OFF \
+            CUDAToolkit_ROOT=/usr/local/cuda CMAKE_CUDA_COMPILER="$NVCC_FOUND"
+
+RUN mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include && \
+    cp /build/onnxruntime_build/Release/libonnxruntime*.so* /opt/onnxruntime/lib/ && \
+    cd /opt/onnxruntime/lib && ln -sf libonnxruntime.so.1.16.0 libonnxruntime.so && \
+    cp -r /build/onnxruntime/include/onnxruntime /opt/onnxruntime/include/
+
+FROM onnx-builder as runtime
+
+ARG PARALLEL_JOBS=4
+
+ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:/usr/local/lib:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace
+COPY src /workspace/src
+
+RUN mkdir -p build && cd build && \
+    cmake ../src \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS="-I/opt/onnxruntime/include/onnxruntime/core/session" \
+        -DONNXRUNTIME_LIB=/opt/onnxruntime/lib/libonnxruntime.so \
+        -DONNXRUNTIME_INCLUDE_DIR=/opt/onnxruntime/include && \
+    make -j${PARALLEL_JOBS}
+
+CMD ["/bin/bash"]

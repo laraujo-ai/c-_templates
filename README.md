@@ -10,7 +10,7 @@ The template provides the full build stack out of the box: GStreamer ingestion, 
 
 | Layer | Component | Notes |
 |---|---|---|
-| Ingestion | `stream_handler` | GStreamer RTSP + file source, multi-threaded clip queue |
+| Ingestion | `stream_handler` | GStreamer RTSP + file source, per-frame queue (`FrameContainer`) |
 | Inference | `common` (base_model / onnx_session) | Template base class for any ONNX model |
 | Detection | `object_detection` (YOLOX) | Swap for your own detector by subclassing `IBaseModel` |
 | Tracking | `tracker` (SORT) | Eigen3-based Kalman filter tracker |

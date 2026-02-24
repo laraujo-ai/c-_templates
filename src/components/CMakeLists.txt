@@ -1,0 +1,3 @@
+add_subdirectory(stream_handler)
+add_subdirectory(object_detection)
+add_subdirectory(tracker)
