@@ -49,6 +49,14 @@ private:
     int MAX_RECONNECT_ATTEMPTS_;
     int FRAME_TIMEOUT_MS_;
 
+    // Timestamp anchor — per-instance so multiple cameras don't corrupt each other
+    std::mutex              anchor_mutex_;
+    bool                    anchor_set_{false};
+    uint64_t                anchor_pts_{0};
+    std::chrono::time_point<std::chrono::system_clock> anchor_system_time_;
+
+    static GstPadProbeReturn timestampAnchorProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+
     void gstreamerLoop();
     void captureLoop();
     bool initializeGStreamer();
@@ -59,6 +67,7 @@ private:
     std::string buildNvidiaHardwarePipeline() const;
     std::string getDepayElement() const;
     std::string getParserElement() const;
+    std::string getDecoderElement() const;
 
     /**
      * @brief Wraps a decoded frame in a FrameContainer and enqueues it.

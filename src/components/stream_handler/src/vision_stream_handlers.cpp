@@ -6,40 +6,51 @@
 #include <mutex>
 
 namespace {
-    std::mutex anchor_mutex;
-    bool anchor_set = false;
-    std::chrono::time_point<std::chrono::system_clock> anchor_system_time;
-    uint64_t anchor_pts = 0;
+    /**
+     * @brief Checks if NVIDIA Jetson hardware decoder is available in the GStreamer registry.
+     *
+     * Probes for nvv4l2decoder at runtime — present on Jetson (installed by JetPack),
+     * absent on x86_64. This allows the same compiled binary to automatically select
+     * the correct GStreamer pipeline for the current platform.
+     */
+    bool hasNvidiaHardwareDecoder() {
+        GstElementFactory* factory = gst_element_factory_find("nvv4l2decoder");
+        if (factory) {
+            gst_object_unref(factory);
+            return true;
+        }
+        return false;
+    }
 }
 
-GstPadProbeReturn timestamp_anchor_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
-    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+namespace project_x {
+
+GstPadProbeReturn GStreamerRTSPHandler::timestampAnchorProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
+    GStreamerRTSPHandler* handler = static_cast<GStreamerRTSPHandler*>(user_data);
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
 
     if (buffer->pts != GST_CLOCK_TIME_NONE) {
-        std::lock_guard<std::mutex> lock(anchor_mutex);
+        std::lock_guard<std::mutex> lock(handler->anchor_mutex_);
         bool is_reset = false;
-        if (anchor_set && buffer->pts < anchor_pts) {
-            uint64_t drop = anchor_pts - buffer->pts;
-            if (drop > GST_SECOND) {
+        if (handler->anchor_set_ && buffer->pts < handler->anchor_pts_) {
+            if (handler->anchor_pts_ - buffer->pts > GST_SECOND)
                 is_reset = true;
-            }
         }
-        if (!anchor_set || is_reset) {
-            anchor_system_time = std::chrono::system_clock::now();
-            anchor_pts = buffer->pts;
-            anchor_set = true;
+        if (!handler->anchor_set_ || is_reset) {
+            handler->anchor_system_time_ = std::chrono::system_clock::now();
+            handler->anchor_pts_         = buffer->pts;
+            handler->anchor_set_         = true;
 
-            LOG_INFO("ANCHOR SET/RESET! Base PTS: {}, UTC Time (ms): {}",
-                     GST_TIME_AS_MSECONDS(anchor_pts),
+            LOG_INFO("ANCHOR SET/RESET [{}]! Base PTS: {}, UTC Time (ms): {}",
+                     handler->camera_id_,
+                     GST_TIME_AS_MSECONDS(handler->anchor_pts_),
                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                         anchor_system_time.time_since_epoch()).count());
+                         handler->anchor_system_time_.time_since_epoch()).count());
         }
     }
 
     return GST_PAD_PROBE_OK;
 }
-
-namespace project_x {
 
 // ---------------------------------------------------------------------------
 // GStreamerRTSPHandler
@@ -120,20 +131,45 @@ bool GStreamerRTSPHandler::isActive() const {
 }
 
 std::string GStreamerRTSPHandler::buildNvidiaHardwarePipeline() const {
-    std::stringstream ss;
-    ss << "rtspsrc location=\"" << rtsp_url_ << "\" "
-       << "latency=50 protocols=tcp ntp-sync=true ! "
-       << getDepayElement() << " name=depay ! "
-       << getParserElement() << " ! "
-       << "nvv4l2decoder enable-max-performance=1 disable-dpb=true ! "
-       << "nvvidconv ! "
-       << "videorate ! "
-       << "video/x-raw, width=" << target_width_ << ", height=" << target_height_
-       << ", framerate=" << target_fps_ << "/1 ! "
-       << "videoconvert ! "
-       << "video/x-raw, format=BGR ! "
-       << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true";
-    return ss.str();
+    std::stringstream pipeline_str;
+    bool use_hardware = hasNvidiaHardwareDecoder();
+
+    LOG_INFO("Building RTSP pipeline for camera '{}' using {} decoding",
+             camera_id_, use_hardware ? "hardware (NVIDIA)" : "software");
+
+    if (use_hardware) {
+        // NVIDIA Jetson hardware-accelerated pipeline
+        pipeline_str << "rtspsrc location=\"" << rtsp_url_ << "\" "
+                     << "latency=50 protocols=tcp ntp-sync=true ! "
+                     << getDepayElement() << " name=depay ! "
+                     << getParserElement() << " ! "
+                     << "nvv4l2decoder enable-max-performance=1 disable-dpb=true ! "
+                     << "nvvidconv ! "
+                     << "videorate ! "
+                     << "video/x-raw, width=" << target_width_
+                     << ", height=" << target_height_
+                     << ", framerate=" << target_fps_ << "/1 ! "
+                     << "videoconvert ! "
+                     << "video/x-raw, format=BGR ! "
+                     << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true";
+    } else {
+        // Software (CPU) decoding — x86_64 and other platforms
+        pipeline_str << "rtspsrc location=\"" << rtsp_url_ << "\" "
+                     << "latency=50 protocols=tcp ! "
+                     << getDepayElement() << " name=depay ! "
+                     << getParserElement() << " ! "
+                     << getDecoderElement() << " ! "
+                     << "videoconvert ! "
+                     << "videoscale ! "
+                     << "videorate ! "
+                     << "video/x-raw,width=" << target_width_
+                     << ",height=" << target_height_
+                     << ",framerate=" << target_fps_ << "/1 ! "
+                     << "videoconvert ! "
+                     << "video/x-raw,format=BGR ! "
+                     << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true";
+    }
+    return pipeline_str.str();
 }
 
 std::string GStreamerRTSPHandler::getDepayElement() const {
@@ -147,6 +183,14 @@ std::string GStreamerRTSPHandler::getParserElement() const {
     switch (stream_codec_) {
         case StreamCodec::H265: return "h265parse";
         default:                return "h264parse";
+    }
+}
+
+std::string GStreamerRTSPHandler::getDecoderElement() const {
+    switch (stream_codec_) {
+        case StreamCodec::H264: return "avdec_h264";
+        case StreamCodec::H265: return "avdec_h265";
+        default:                return "avdec_h264";
     }
 }
 
@@ -169,11 +213,11 @@ bool GStreamerRTSPHandler::initializeGStreamer() {
         GstPad *sink_pad = gst_element_get_static_pad(depay, "sink");
         if (sink_pad) {
             {
-                std::lock_guard<std::mutex> lock(anchor_mutex);
-                anchor_set = false;
-                anchor_pts = 0;
+                std::lock_guard<std::mutex> lock(anchor_mutex_);
+                anchor_set_ = false;
+                anchor_pts_ = 0;
             }
-            gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, timestamp_anchor_probe, NULL, NULL);
+            gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, timestampAnchorProbe, this, NULL);
             gst_object_unref(sink_pad);
         }
         gst_object_unref(depay);
@@ -329,11 +373,11 @@ GstFlowReturn GStreamerRTSPHandler::onNewSample(GstElement* appsink, gpointer us
             uint64_t current_anchor_pts = 0;
             std::chrono::time_point<std::chrono::system_clock> current_anchor_time;
             {
-                std::lock_guard<std::mutex> lock(anchor_mutex);
-                if (anchor_set) {
-                    has_anchor = true;
-                    current_anchor_pts = anchor_pts;
-                    current_anchor_time = anchor_system_time;
+                std::lock_guard<std::mutex> lock(handler->anchor_mutex_);
+                if (handler->anchor_set_) {
+                    has_anchor          = true;
+                    current_anchor_pts  = handler->anchor_pts_;
+                    current_anchor_time = handler->anchor_system_time_;
                 }
             }
 
@@ -504,17 +548,39 @@ bool GStreamerFileHandler::isActive() const {
 }
 
 std::string GStreamerFileHandler::buildNvidiaHardwarePipeline() const {
-    std::stringstream ss;
-    ss << "filesrc location=\"" << file_path_ << "\" ! "
-       << "decodebin ! "
-       << "nvvideoconvert ! "
-       << "videorate ! "
-       << "video/x-raw,width=" << target_width_ << ",height=" << target_height_
-       << ",framerate=" << target_fps_ << "/1 ! "
-       << "videoconvert ! "
-       << "video/x-raw,format=BGR ! "
-       << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=false";
-    return ss.str();
+    std::stringstream pipeline_str;
+    bool use_hardware = hasNvidiaHardwareDecoder();
+
+    LOG_INFO("Building file pipeline using {} decoding",
+             use_hardware ? "hardware (NVIDIA)" : "software");
+
+    if (use_hardware) {
+        // NVIDIA Jetson hardware-accelerated pipeline
+        pipeline_str << "filesrc location=\"" << file_path_ << "\" ! "
+                     << "decodebin ! "
+                     << "nvvideoconvert ! "
+                     << "videorate ! "
+                     << "video/x-raw,width=" << target_width_
+                     << ",height=" << target_height_
+                     << ",framerate=" << target_fps_ << "/1 ! "
+                     << "videoconvert ! "
+                     << "video/x-raw,format=BGR ! "
+                     << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=false";
+    } else {
+        // Software decoding — x86_64 and other platforms
+        pipeline_str << "filesrc location=\"" << file_path_ << "\" ! "
+                     << "decodebin ! "
+                     << "videoconvert ! "
+                     << "videoscale ! "
+                     << "videorate ! "
+                     << "video/x-raw,width=" << target_width_
+                     << ",height=" << target_height_
+                     << ",framerate=" << target_fps_ << "/1 ! "
+                     << "videoconvert ! "
+                     << "video/x-raw,format=BGR ! "
+                     << "appsink name=sink emit-signals=true sync=false max-buffers=2 drop=false";
+    }
+    return pipeline_str.str();
 }
 
 bool GStreamerFileHandler::initializeGStreamer() {
